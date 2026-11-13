@@ -7,8 +7,9 @@ only the files that differ are downloaded, from raw.githubusercontent.com, with
 no GitHub API call.
 """
 
+import os
 from pathlib import Path
-from typing import Callable, Optional, Dict
+from typing import Callable, Dict, List, Optional, Tuple
 from utils.core.logging import get_logger
 from utils.core.paths import get_classic_skins_dir, get_skins_dir, get_user_data_dir
 from utils.core.safe_extract import is_safe_path
@@ -16,6 +17,30 @@ from utils.core.safe_extract import is_safe_path
 log = get_logger()
 
 ProgressCallback = Callable[[int, Optional[str]], None]
+
+
+def _listing(folder) -> List[os.DirEntry]:
+    """The entries of *folder*, none when it cannot be listed."""
+    try:
+        with os.scandir(folder) as entries:
+            return list(entries)
+    except OSError:
+        return []
+
+
+def _is_id(name: str) -> bool:
+    try:
+        int(name)
+        return True
+    except ValueError:
+        return False
+
+
+def _id_files(skin_id: str, entries: List[os.DirEntry]) -> Tuple[bool, bool]:
+    """Whether a skin's or chroma's folder holds its archive, and its preview."""
+    names = {os.path.normcase(entry.name) for entry in entries}
+    has_archive = any(os.path.normcase(f"{skin_id}{ext}") in names for ext in (".zip", ".fantome"))
+    return has_archive, os.path.normcase(f"{skin_id}.png") in names
 
 
 class RepoDownloader:
@@ -113,59 +138,36 @@ class RepoDownloader:
         Returns:
             Dict with keys: 'total_skins', 'total_chromas', 'total_ids', 'total_previews'
         """
-        if not self.target_dir.exists():
-            return {'total_skins': 0, 'total_chromas': 0, 'total_ids': 0, 'total_previews': 0}
-        
         total_skins = 0  # Base skins only (zip files in skin subdirectories)
         total_chromas = 0  # Chromas only (zip files in chroma subdirectories)
         total_previews = 0  # All preview images (png files)
-        
-        for champion_dir in self.target_dir.iterdir():
+
+        # One listing per folder, instead of three exists() calls per skin and
+        # chroma: this runs twice per start, and took 1.9 s each time over a
+        # library of 9,000 skins and chromas
+        for champion_dir in _listing(self.target_dir):
             if not champion_dir.is_dir():
                 continue
-            
+
             # Count skins and chromas in skin subdirectories
             # Structure: {champion_id}/{skin_id}/{skin_id}.zip and {skin_id}.png
-            for skin_dir in champion_dir.iterdir():
-                if not skin_dir.is_dir():
+            for skin_dir in _listing(champion_dir.path):
+                if not skin_dir.is_dir() or not _is_id(skin_dir.name):
                     continue
-                
-                # Check if this is a skin directory (contains only numeric name)
-                try:
-                    int(skin_dir.name)  # If this succeeds, it's a skin ID directory
-                    
-                    # Count base skin files
-                    skin_zip = skin_dir / f"{skin_dir.name}.zip"
-                    skin_fantome = skin_dir / f"{skin_dir.name}.fantome"
-                    skin_png = skin_dir / f"{skin_dir.name}.png"
+                skin_entries = _listing(skin_dir.path)
+                has_archive, has_preview = _id_files(skin_dir.name, skin_entries)
+                total_skins += has_archive
+                total_previews += has_preview
 
-                    if skin_zip.exists() or skin_fantome.exists():
-                        total_skins += 1
-                    if skin_png.exists():
-                        total_previews += 1
+                # Count chromas in this skin's chroma subdirectories
+                # Structure: {champion_id}/{skin_id}/{chroma_id}/{chroma_id}.zip or .fantome
+                for chroma_dir in skin_entries:
+                    if not chroma_dir.is_dir() or not _is_id(chroma_dir.name):
+                        continue
+                    has_archive, has_preview = _id_files(chroma_dir.name, _listing(chroma_dir.path))
+                    total_chromas += has_archive
+                    total_previews += has_preview
 
-                    # Count chromas in this skin's chroma subdirectories
-                    # Structure: {champion_id}/{skin_id}/{chroma_id}/{chroma_id}.zip or .fantome
-                    for chroma_dir in skin_dir.iterdir():
-                        if chroma_dir.is_dir():
-                            try:
-                                int(chroma_dir.name)  # If this succeeds, it's a chroma ID directory
-
-                                chroma_zip = chroma_dir / f"{chroma_dir.name}.zip"
-                                chroma_fantome = chroma_dir / f"{chroma_dir.name}.fantome"
-                                chroma_png = chroma_dir / f"{chroma_dir.name}.png"
-
-                                if chroma_zip.exists() or chroma_fantome.exists():
-                                    total_chromas += 1
-                                if chroma_png.exists():
-                                    total_previews += 1
-                            except ValueError:
-                                # Not a chroma directory, skip
-                                continue
-                except ValueError:
-                    # Not a skin directory, skip
-                    continue
-        
         return {
             'total_skins': total_skins,
             'total_chromas': total_chromas,
