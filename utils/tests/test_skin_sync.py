@@ -216,6 +216,28 @@ class SkinSyncTests(unittest.TestCase):
         self.assertFalse(self.local("skins/1/1001/1002/1002.fantome").exists())
         self.assertTrue((self.skins / skin_sync.STATE_FILE).exists())  # Rose's own files stay
 
+    def test_the_cleanup_only_removes_the_folders_it_empties(self):
+        self.sync()
+        dotted = self.skins / "9" / "9001" / ".partial"
+        dotted.parent.mkdir(parents=True)
+        dotted.write_bytes(b"Rose's own")
+        (self.skins / "9" / "9001" / "9001.fantome").write_bytes(b"removed upstream")
+        empty = self.skins / "7" / "7001" / "7002"
+        empty.mkdir(parents=True)
+        self.github.etag = '"manifest-2"'
+
+        with patch.object(skin_sync.os, "rmdir", wraps=skin_sync.os.rmdir) as rmdir:
+            result = self.sync()
+
+        self.assertEqual(result.removed, 1)
+        self.assertTrue(dotted.exists())  # a dot file keeps its folder
+        self.assertFalse((self.skins / "7").exists())  # an empty branch goes, deepest first
+        self.assertTrue(self.skins.is_dir())
+        self.assertTrue(self.local("skins/1/1001/1002/1002.fantome").exists())
+        # Folders that still hold files are not even tried
+        tried = sorted(Path(call.args[0]).relative_to(self.root).as_posix() for call in rmdir.call_args_list)
+        self.assertEqual(tried, ["skins/7", "skins/7/7001", "skins/7/7001/7002"])
+
     def test_a_rewritten_commit_falls_back_to_main(self):
         self.github.commit_gone = True
 

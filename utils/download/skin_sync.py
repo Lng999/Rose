@@ -408,22 +408,32 @@ class SkinSync:
         for root in self.roots:
             if not root.is_dir():
                 continue
-            for local in list(root.rglob("*")):
-                # Rose's own state and temporary files start with a dot
-                if not local.is_file() or local.name.startswith("."):
-                    continue
-                if os.path.normcase(str(local)) in expected:
-                    continue
-                try:
-                    local.unlink()
-                    removed += 1
-                except OSError as e:
-                    log.debug(f"[SKINS] Could not remove {local}: {e}")
-            for folder in sorted((p for p in root.rglob("*") if p.is_dir()), key=lambda p: len(p.parts), reverse=True):
-                try:
-                    folder.rmdir()  # only empty ones
-                except OSError:
-                    pass
+            # One walk, deepest folders first, that only tries to remove the
+            # folders it emptied (or found empty): two rglob() passes, a stat
+            # per file and an rmdir() on each of the library's 9,000 folders
+            # took about 5 s at every start
+            root_path = os.fspath(root)
+            gone_folders = set()
+            for folder, subfolders, names in os.walk(root_path, topdown=False):
+                emptied = all(os.path.join(folder, sub) in gone_folders for sub in subfolders)
+                for name in names:
+                    local = os.path.join(folder, name)
+                    # Rose's own state and temporary files start with a dot
+                    if name.startswith(".") or os.path.normcase(local) in expected or not os.path.isfile(local):
+                        emptied = False
+                        continue
+                    try:
+                        os.unlink(local)
+                        removed += 1
+                    except OSError as e:
+                        emptied = False
+                        log.debug(f"[SKINS] Could not remove {local}: {e}")
+                if emptied and folder != root_path:
+                    try:
+                        os.rmdir(folder)
+                        gone_folders.add(folder)
+                    except OSError:
+                        pass
         known = state["files"]
         for path in [p for p in known if p not in manifest.files]:
             del known[path]
