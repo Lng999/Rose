@@ -7,15 +7,25 @@ only the files that differ are downloaded, from raw.githubusercontent.com, with
 no GitHub API call.
 """
 
+import os
 from pathlib import Path
 from typing import Callable, Optional, Dict
 from utils.core.logging import get_logger
 from utils.core.paths import get_classic_skins_dir, get_skins_dir, get_user_data_dir
-from utils.core.safe_extract import is_safe_path
 
 log = get_logger()
 
 ProgressCallback = Callable[[int, Optional[str]], None]
+
+
+def _stays_within(base_dir: Path, path: Path) -> bool:
+    """Whether *path* is still under *base_dir* once its ".." are applied.
+
+    Lexical: os.path.abspath reads no file. Path.resolve() opened every path
+    of the library (11,000 of them, twice per sync: 10 s at each start)
+    to check names that come from LeagueSkins' manifest.
+    """
+    return Path(os.path.abspath(path)).is_relative_to(os.path.abspath(base_dir))
 
 
 class RepoDownloader:
@@ -52,7 +62,7 @@ class RepoDownloader:
         else:
             return None
         local_path = base_dir / relative
-        if not is_safe_path(base_dir, local_path):
+        if not _stays_within(base_dir, local_path):
             log.warning(f"Skipping repository path outside the target folder: {repo_path}")
             return None
         return local_path
