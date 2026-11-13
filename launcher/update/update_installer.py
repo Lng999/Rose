@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from utils.core.logging import get_named_logger
-from utils.core.safe_extract import safe_extract, is_safe_path
+from utils.core.safe_extract import validate_archive_members
 
 updater_log = get_named_logger("updater", prefix="log_updater")
 
@@ -98,11 +98,15 @@ class UpdateInstaller:
 
         try:
             with zipfile.ZipFile(zip_path, "r") as zip_file:
+                # Security: refuse a path leaving the staging folder (or an
+                # absurd size) before writing anything. The archive is opened
+                # once: reopening it for every member, as safe_extract does,
+                # took seconds per thousand files
+                validate_archive_members(zip_file, staging_dir)
                 members = zip_file.infolist()
                 total_members = max(len(members), 1)
                 for index, member in enumerate(members, start=1):
-                    # Security: Use safe extraction to prevent path traversal attacks
-                    safe_extract(zip_path, member.filename, staging_dir)
+                    zip_file.extract(member, staging_dir)
                     progress = 40 + int(20 * index / total_members)
                     progress_callback(min(progress, 60))
 

@@ -60,6 +60,14 @@ def _validate_members(zf: zipfile.ZipFile, dest_resolved: Path) -> None:
             )
 
 
+def validate_archive_members(zf: zipfile.ZipFile, dest_dir: Union[str, Path]) -> None:
+    """Refuse an open archive that extracting into dest_dir would refuse, before anything is written.
+
+    Raises UnsafePathError (ArchiveTooLargeError for an absurd size).
+    """
+    _validate_members(zf, Path(dest_dir).resolve())
+
+
 def join_within(resolved_base: Path, relative_path: str) -> Optional[Path]:
     """Join *relative_path* to an already resolved base, or return None if it escapes the base.
 
