@@ -13,7 +13,8 @@ this used before took 9 calls per start, 18 when the files changed).
 import json
 import requests
 from pathlib import Path
-from typing import Optional, Dict, Callable
+from typing import BinaryIO, Callable, Dict, Optional
+from utils.core.atomic_file import atomic_write
 from utils.core.logging import get_logger, get_named_logger, log_success
 from config import APP_USER_AGENT, get_config_file_path
 
@@ -24,6 +25,8 @@ GITHUB_RAW_BASE = "https://raw.githubusercontent.com/CommunityDragon/Data/master
 HASHES_DIR = "hashes/lol"
 HASH_FILES = [f"hashes.game.txt.{i}" for i in range(9)]
 TARGET_FILE = "hashes.game.txt"
+_CHUNK = 1024 * 1024
+NEWLINE = b"\n"
 
 
 def get_state_file() -> Path:
@@ -116,75 +119,94 @@ def check_for_updates(target_exists: bool = True) -> bool:
     return False
 
 
-def download_file(url: str, session: requests.Session, status_callback: Optional[Callable[[str], None]] = None,
-                  etags: Optional[Dict[str, str]] = None) -> Optional[bytes]:
-    """Download a file from URL
-    
+class _DownloadFailed(Exception):
+    """A hash file could not be downloaded (already logged and reported)."""
+
+
+def append_file(url: str, session: requests.Session, out: BinaryIO,
+                status_callback: Optional[Callable[[str], None]] = None,
+                etags: Optional[Dict[str, str]] = None) -> bool:
+    """Stream a hash file from URL into *out*, without its trailing newlines
+
     Args:
         url: URL to download from
         session: Requests session to use
+        out: Where the file's lines go
         status_callback: Optional callback for status updates
         etags: Optional dict receiving the file's ETag under its name
 
     Returns:
-        File contents as bytes, or None on error
+        Whether anything was written
     """
+    filename = url.split('/')[-1]
     try:
-        filename = url.split('/')[-1]
         if status_callback:
             status_callback(f"Downloading {filename}...")
 
-        response = session.get(url, timeout=30, stream=True)
-        response.raise_for_status()
-        if etags is not None and response.headers.get('ETag'):
-            etags[filename] = response.headers['ETag']
+        with session.get(url, timeout=30, stream=True) as response:
+            response.raise_for_status()
+            if etags is not None and response.headers.get('ETag'):
+                etags[filename] = response.headers['ETag']
 
-        # Get total size if available
-        total_size = int(response.headers.get('content-length', 0))
-        downloaded = 0
-        chunks = []
-        
-        for chunk in response.iter_content(chunk_size=8192):
-            if chunk:
-                chunks.append(chunk)
+            downloaded = 0
+            wrote = False
+            # Newlines at the end of what came so far: dropped if the file ends there
+            held = b""
+            for chunk in response.iter_content(chunk_size=_CHUNK):
+                if not chunk:
+                    continue
                 downloaded += len(chunk)
-                
+                body = chunk.rstrip(NEWLINE)
+                if body:
+                    out.write(held + body)
+                    held = chunk[len(body):]
+                    wrote = True
+                else:
+                    held += chunk
+
                 # Update status with progress if callback provided
                 if status_callback:
-                    size_mb = downloaded / (1024 * 1024)
-                    status_callback(f"Downloading {filename}... ({size_mb:.1f} MB)")
-        
-        content = b''.join(chunks)
-        
-        size_mb = len(content) / (1024 * 1024)
+                    status_callback(f"Downloading {filename}... ({downloaded / (1024 * 1024):.1f} MB)")
+
+        size_mb = downloaded / (1024 * 1024)
         updater_log.info(f"Downloaded {filename} ({size_mb:.1f} MB)")
         if status_callback:
             status_callback(f"Downloaded {filename} ({size_mb:.1f} MB)")
-        
-        return content
+        return wrote
     except requests.RequestException as e:
-        filename = url.split('/')[-1]
         log.error(f"Failed to download {url}: {e}")
         updater_log.error(f"Failed to download {filename}: {e}")
         if status_callback:
             status_callback(f"Failed to download {filename}")
-        return None
+        raise _DownloadFailed(filename) from e
 
 
-def combine_hash_files(contents: list[bytes]) -> bytes:
-    """Combine multiple hash files into one
-    
-    Args:
-        contents: List of hash file contents
-    
-    Returns:
-        Combined file content
+def write_hash_files(target_path: Path, session: requests.Session,
+                     status_callback: Optional[Callable[[str], None]] = None,
+                     etags: Optional[Dict[str, str]] = None) -> int:
+    """Download the hash files into *target_path*, one after the other.
+
+    The content is CommunityDragon's files joined by a newline, each without
+    its trailing newlines, and ending with one. It streams to a temporary file
+    that only replaces *target_path* once every file came: holding the files,
+    then the joined text, in memory took 900 MB for the 234 MB of today's
+    files, and a failed write destroyed the file already there.
+
+    Returns the size written; raises _DownloadFailed or OSError.
     """
-    texts = [c.decode('utf-8') for c in contents]
-    combined = '\n'.join(t.rstrip('\n') for t in texts)
-    if combined and not combined.endswith('\n'):
-        combined += '\n'
-    return combined.encode('utf-8')
+    with atomic_write(target_path, "wb") as out:
+        ends_with_newline = False
+        for index, hash_file in enumerate(HASH_FILES):
+            if index:
+                out.write(NEWLINE)
+                ends_with_newline = True
+            log.info(f"Downloading {hash_file}...")
+            updater_log.info(f"Downloading {hash_file}...")
+            if append_file(_file_url(hash_file), session, out, status_callback, etags):
+                ends_with_newline = False
+        if out.tell() and not ends_with_newline:
+            out.write(NEWLINE)
+        return out.tell()
 
 
 def update_hash_files(status_callback: Optional[Callable[[str], None]] = None, dev_mode: bool = False) -> bool:
@@ -249,31 +271,6 @@ def update_hash_files(status_callback: Optional[Callable[[str], None]] = None, d
     session = requests.Session()
     session.headers.update({'User-Agent': APP_USER_AGENT})
 
-    # Download all hash files
-    contents = []
-    etags: Dict[str, str] = {}
-    for hash_file in HASH_FILES:
-        url = _file_url(hash_file)
-        log.info(f"Downloading {hash_file}...")
-        updater_log.info(f"Downloading {hash_file}...")
-        if status_callback:
-            status_callback(f"Downloading {hash_file}...")
-        content = download_file(url, session, status_callback, etags)
-        if content is None:
-            log.error(f"Failed to download {hash_file}")
-            updater_log.error(f"Failed to download {hash_file}")
-            if status_callback:
-                status_callback(f"Failed to download {hash_file}")
-            return False
-        contents.append(content)
-    
-    # Combine files
-    log.info("Merging hashes files...")
-    updater_log.info("Merging hashes files...")
-    if status_callback:
-        status_callback("Merging hashes files...")
-    combined_content = combine_hash_files(contents)
-    
     # Get target path (same logic as injection manager)
     if getattr(sys, 'frozen', False):
         # Running as compiled executable
@@ -301,26 +298,32 @@ def update_hash_files(status_callback: Optional[Callable[[str], None]] = None, d
     
     tools_dir.mkdir(parents=True, exist_ok=True)
     target_path = tools_dir / TARGET_FILE
-    
-    # Write combined file
+
+    # Download all hash files straight into the target
+    etags: Dict[str, str] = {}
     try:
         updater_log.info(f"Writing {TARGET_FILE}...")
         if status_callback:
             status_callback(f"Writing {TARGET_FILE}...")
-        with open(target_path, 'wb') as f:
-            f.write(combined_content)
-        size_mb = len(combined_content) / (1024 * 1024)
+        written = write_hash_files(target_path, session, status_callback, etags)
+        size_mb = written / (1024 * 1024)
         log_success(log, f"Successfully created {TARGET_FILE} ({size_mb:.1f} MB)", "")
         updater_log.info(f"Successfully created {TARGET_FILE} ({size_mb:.1f} MB)")
         if status_callback:
             status_callback(f"Successfully created {TARGET_FILE} ({size_mb:.1f} MB)")
-    except IOError as e:
+    except _DownloadFailed as e:
+        log.error(f"Failed to download {e}")
+        updater_log.error(f"Failed to download {e}")
+        if status_callback:
+            status_callback(f"Failed to download {e}")
+        return False
+    except OSError as e:
         log.error(f"Failed to write {TARGET_FILE}: {e}")
         updater_log.error(f"Failed to write {TARGET_FILE}: {e}")
         if status_callback:
             status_callback(f"Failed to write {TARGET_FILE}")
         return False
-    
+
     # Record what was downloaded: the next start compares these ETags
     if len(etags) == len(HASH_FILES):
         save_state({'etags': etags})
