@@ -20,6 +20,9 @@ from .update_installer import UpdateInstaller
 log = get_logger()
 updater_log = get_named_logger("updater", prefix="log_updater")
 
+# [General] option holding the release whose installation failed every retry
+FAILED_VERSION_OPTION = "update_failed_version"
+
 
 def _parse_semver_like(version: str) -> Optional[tuple[int, ...]]:
     """
@@ -156,8 +159,15 @@ class UpdateSequence:
         MAX_UPDATE_RETRIES = 3
         installed_parsed = _parse_semver_like(installed_version)
         app_parsed = _parse_semver_like(APP_VERSION)
+        # The release given up on (see below): not downloaded again
+        failed_parsed = _parse_semver_like(
+            config.get("General", FAILED_VERSION_OPTION, fallback="")
+        )
 
-        if _cmp_version(installed_parsed, app_parsed) == 1:
+        if (
+            _cmp_version(installed_parsed, app_parsed) == 1
+            and _cmp_version(installed_parsed, failed_parsed) != 0
+        ):
             # Config claims a newer version than what is actually running —
             # the previous update's file copy did not succeed.
             retry_count = config.getint("General", "update_retry_count", fallback=0)
@@ -167,9 +177,11 @@ class UpdateSequence:
                     f"Giving up (still running {APP_VERSION})."
                 )
                 # Clear the retry counter so a *future* release can still be
-                # attempted.  Leave installed_version as-is to suppress
-                # re-downloading the same broken release.
+                # attempted, and remember this one so it is not downloaded
+                # again: installed_version alone could not stop it, Rose
+                # writes its running version there at every start
                 config.set("General", "update_retry_count", "0")
+                config.set("General", FAILED_VERSION_OPTION, installed_version)
                 try:
                     write_config_file(config, config_path)
                 except Exception as e:
@@ -225,7 +237,15 @@ class UpdateSequence:
                     updater_log.warning(f"Could not persist update state to {config_path}: {e}")
             status_callback("Launcher is already up to date")
             return False
-        
+
+        if _cmp_version(remote_parsed, failed_parsed) == 0:
+            updater_log.warning(
+                f"Not downloading {remote_version} again: installing it failed "
+                f"{MAX_UPDATE_RETRIES} times. Waiting for a newer release."
+            )
+            status_callback("Update failed after retries")
+            return False
+
         if dev_mode:
             status_callback("Update skipped (dev mode)")
             return False
